@@ -1,5 +1,4 @@
 import logging
-import os
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +6,8 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_only
+
+from utils import save_json
 
 
 def count_trainable_parameters(model):
@@ -72,7 +73,14 @@ class Seq2SeqLoggingCallback(pl.Callback):
 
     @rank_zero_only
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        save_json(pl_module.metrics, pl_module.metrics_save_path)
         return self._write_logs(trainer, pl_module, "test")
+
+    @rank_zero_only
+    def on_validation_end(self, trainer: pl.Trainer, pl_module):
+        save_json(pl_module.metrics, pl_module.metrics_save_path)
+        # Uncommenting this will save val generations
+        # return self._write_logs(trainer, pl_module, "valid")
 
 
 def get_checkpoint_callback(output_dir, metric, save_top_k=1, lower_is_better=False):
@@ -89,11 +97,11 @@ def get_checkpoint_callback(output_dir, metric, save_top_k=1, lower_is_better=Fa
         )
 
     checkpoint_callback = ModelCheckpoint(
-        filepath=os.path.join(output_dir, exp),
+        dirpath=output_dir,
+        filename=exp,
         monitor=f"val_{metric}",
         mode="min" if "loss" in metric else "max",
         save_top_k=save_top_k,
-        period=0,  # maybe save a checkpoint every time val is run, not just end of epoch.
     )
     return checkpoint_callback
 

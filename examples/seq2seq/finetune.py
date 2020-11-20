@@ -1,7 +1,10 @@
+#!/usr/bin/env python
+
 import argparse
 import glob
 import logging
 import os
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -13,9 +16,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from callbacks import Seq2SeqLoggingCallback, get_checkpoint_callback, get_early_stopping_callback
-from lightning_base import BaseTransformer, add_generic_args, generic_train
 from transformers import MBartTokenizer, T5ForConditionalGeneration
-from transformers.modeling_bart import shift_tokens_right
+from transformers.models.bart.modeling_bart import shift_tokens_right
 from utils import (
     ROUGE_KEYS,
     LegacySeq2SeqDataset,
@@ -23,7 +25,9 @@ from utils import (
     assert_all_frozen,
     calculate_bleu,
     calculate_rouge,
+    check_output_dir,
     flatten_list,
+    freeze_embeds,
     freeze_params,
     get_git_info,
     label_smoothed_nll_loss,
@@ -33,6 +37,11 @@ from utils import (
     save_json,
     use_task_specific_params,
 )
+
+
+# need the parent dir module
+sys.path.insert(2, str(Path(__file__).resolve().parents[1]))
+from lightning_base import BaseTransformer, add_generic_args, generic_train  # noqa
 
 
 logger = logging.getLogger(__name__)
@@ -84,7 +93,7 @@ class SummarizationModule(BaseTransformer):
         assert self.target_lens["train"] <= self.target_lens["val"], f"target_lens: {self.target_lens}"
         assert self.target_lens["train"] <= self.target_lens["test"], f"target_lens: {self.target_lens}"
         if self.hparams.freeze_embeds:
-            self.freeze_embeds()
+            freeze_embeds(self.model)
         if self.hparams.freeze_encoder:
             freeze_params(self.model.get_encoder())
             assert_all_frozen(self.model.get_encoder())
@@ -98,29 +107,24 @@ class SummarizationModule(BaseTransformer):
         self.dataset_class = (
             Seq2SeqDataset if hasattr(self.tokenizer, "prepare_seq2seq_batch") else LegacySeq2SeqDataset
         )
+        self.already_saved_batch = False
         self.eval_beams = self.model.config.num_beams if self.hparams.eval_beams is None else self.hparams.eval_beams
-        assert self.eval_beams >= 1, f"got self.eval_beams={self.eval_beams}. Need an integer > 1"
         if self.hparams.eval_max_gen_length is not None:
             self.eval_max_length = self.hparams.eval_max_gen_length
         else:
             self.eval_max_length = self.model.config.max_length
         self.val_metric = self.default_val_metric if self.hparams.val_metric is None else self.hparams.val_metric
 
-    def freeze_embeds(self):
-        """Freeze token embeddings and positional embeddings for bart, just token embeddings for t5."""
-        if self.model_type == "t5":
-            freeze_params(self.model.shared)
-            for d in [self.model.encoder, self.model.decoder]:
-                freeze_params(d.embed_tokens)
-        elif self.model_type == "fsmt":
-            for d in [self.model.model.encoder, self.model.model.decoder]:
-                freeze_params(d.embed_positions)
-                freeze_params(d.embed_tokens)
-        else:
-            freeze_params(self.model.model.shared)
-            for d in [self.model.model.encoder, self.model.model.decoder]:
-                freeze_params(d.embed_positions)
-                freeze_params(d.embed_tokens)
+    def save_readable_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, List[str]]:
+        """A debugging utility"""
+        readable_batch = {
+            k: self.tokenizer.batch_decode(v.tolist()) if "mask" not in k else v.shape for k, v in batch.items()
+        }
+        save_json(readable_batch, Path(self.output_dir) / "text_batch.json")
+        save_json({k: v.tolist() for k, v in batch.items()}, Path(self.output_dir) / "tok_batch.json")
+
+        self.already_saved_batch = True
+        return readable_batch
 
     def forward(self, input_ids, **kwargs):
         return self.model(input_ids, **kwargs)
@@ -139,9 +143,12 @@ class SummarizationModule(BaseTransformer):
             decoder_input_ids = self.model._shift_right(tgt_ids)
         else:
             decoder_input_ids = shift_tokens_right(tgt_ids, pad_token_id)
+        if not self.already_saved_batch:  # This would be slightly better if it only happened on rank zero
+            batch["decoder_input_ids"] = decoder_input_ids
+            self.save_readable_batch(batch)
 
         outputs = self(src_ids, attention_mask=src_mask, decoder_input_ids=decoder_input_ids, use_cache=False)
-        lm_logits = outputs[0]
+        lm_logits = outputs["logits"]
         if self.hparams.label_smoothing == 0:
             # Same behavior as modeling_bart.py, besides ignoring pad_token_id
             ce_loss_fct = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id)
@@ -189,7 +196,7 @@ class SummarizationModule(BaseTransformer):
         losses.update(generative_metrics)
         all_metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
         all_metrics["step_count"] = self.step_count
-        self.save_metrics(all_metrics, prefix)  # writes to self.metrics_save_path
+        self.metrics[prefix].append(all_metrics)  # callback writes this to self.metrics_save_path
         preds = flatten_list([x["preds"] for x in outputs])
         return {
             "log": all_metrics,
@@ -197,10 +204,6 @@ class SummarizationModule(BaseTransformer):
             f"{prefix}_loss": loss,
             f"{prefix}_{self.val_metric}": metric_tensor,
         }
-
-    def save_metrics(self, latest_metrics, type_path) -> None:
-        self.metrics[type_path].append(latest_metrics)
-        save_json(self.metrics, self.metrics_save_path)
 
     def calc_generative_metrics(self, preds, target) -> Dict:
         return calculate_rouge(preds, target)
@@ -248,7 +251,7 @@ class SummarizationModule(BaseTransformer):
     def get_dataloader(self, type_path: str, batch_size: int, shuffle: bool = False) -> DataLoader:
         dataset = self.get_dataset(type_path)
 
-        if self.hparams.sortish_sampler and type_path != "test":
+        if self.hparams.sortish_sampler and type_path != "test" and type_path != "val":
             sampler = dataset.make_sortish_sampler(batch_size, distributed=self.hparams.gpus > 1)
             return DataLoader(
                 dataset,
@@ -259,7 +262,7 @@ class SummarizationModule(BaseTransformer):
                 sampler=sampler,
             )
 
-        elif self.hparams.max_tokens_per_batch is not None and type_path != "test":
+        elif self.hparams.max_tokens_per_batch is not None and type_path != "test" and type_path != "val":
             batch_sampler = dataset.make_dynamic_sampler(
                 self.hparams.max_tokens_per_batch, distributed=self.hparams.gpus > 1
             )
@@ -326,6 +329,7 @@ class SummarizationModule(BaseTransformer):
         parser.add_argument("--freeze_encoder", action="store_true")
         parser.add_argument("--freeze_embeds", action="store_true")
         parser.add_argument("--sortish_sampler", action="store_true", default=False)
+        parser.add_argument("--overwrite_output_dir", action="store_true", default=False)
         parser.add_argument("--max_tokens_per_batch", type=int, default=None)
         parser.add_argument("--logger_name", type=str, choices=["default", "wandb", "wandb_shared"], default="default")
         parser.add_argument("--n_train", type=int, default=-1, required=False, help="# examples. -1 means use all.")
@@ -370,8 +374,8 @@ class TranslationModule(SummarizationModule):
 
 def main(args, model=None) -> SummarizationModule:
     Path(args.output_dir).mkdir(exist_ok=True)
-    if len(os.listdir(args.output_dir)) > 3 and args.do_train:
-        raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
+    check_output_dir(args, expected_items=3)
+
     if model is None:
         if "summarization" in args.task:
             model: SummarizationModule = SummarizationModule(args)
